@@ -12,7 +12,7 @@ PORT = 8888
 POOL_MINER_NAME = 'btccpool1'
 MINING_ALGO = 'sha256'
 BLOCKCHAIN_NAME = 'bitcoin'
-AUTH_URL = ''
+AUTH_URL = 'http://172.16.3.201:8000/api/pool/miners/{}/blockchains/{}'
 
 # 默认转发地址
 DEFAULT_FORWARD_URL = 'stratum.btccpool.com:3333'
@@ -20,11 +20,11 @@ DEFAULT_FORWARD_URL = 'stratum.btccpool.com:3333'
 DEFAULT_POOL_TYPE = 0
 # #############################################################################
 # kafka
-KAFKA_SERVER = ["179.16.3.11:9092", ]
+KAFKA_SERVER = []
 # #############################################################################
 LOG_CONFIG = {
     'level': 'info',  # debug < info < warning < error
-    'filename': '/var/log/mining-pool-proxy/proxy.log',
+    'filename': 'proxy.log',
     'backups': 100,
 }
 # #############################################################################

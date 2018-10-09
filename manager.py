@@ -25,6 +25,7 @@ def parse_args():
 def sig_handler(signum, frame):
     if signum in (signal.SIGINT, signal.SIGTERM,):
         gen_log.info('Stop Pool proxy!')
+        tornado.ioloop.IOLoop.instance().run_sync(stop_kafka)
         tornado.ioloop.IOLoop.current().stop()
 
 
@@ -74,7 +75,7 @@ class ServerEntry:
 
 
 if __name__ == "__main__":
-    # signal.signal(signal.SIGTERM, sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
     # signal.signal(signal.SIGINT, sig_handler)
     args = parse_args()
     ServerEntry().run()

@@ -4,27 +4,16 @@ import time
 from twisted.internet import reactor
 from twisted.internet.protocol import Protocol, ClientCreator, ClientFactory
 
-# import settings
-
 
 class ClientProtocol(Protocol):
     def connectionMade(self):
         self.uuid = time.time()
         print("connectionMade uuid:{}".format(self.uuid))
-        # print(dir(self))
-        # print(dir(self.transport))
-        # for attr in dir(self.transport):
-        #     print((attr, getattr(self.transport, attr)))
-        #
-        # print(dir(self.transport.connector))
-        # print(dir(self.transport.protocol))
         self.transport.write(b'> To Server:Hello server')
 
     def dataReceived(self, data):
         print("connectionMade uuid:{}".format(self.uuid))
         print('> From Server:%s' % data)
-        # reactor.stop()
-        # self.transport.write(data)
 
 
 class ProxyClientFactory(ClientFactory):

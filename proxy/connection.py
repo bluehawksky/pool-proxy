@@ -7,9 +7,11 @@ from tornado.iostream import StreamClosedError
 from tornado.log import app_log
 from tornado.tcpclient import TCPClient
 from tornado.gen import coroutine
+from tornado.escape import json_decode, json_encode
+
 from proxy.auth import miner_auth
 from proxy.error import ErrorCode, ErrorMsg
-from tornado.escape import json_decode, json_encode
+from lib.util import Utils
 from config import POOL_MINER_NAME, JOB_CLEAR_TIME, SUBMIT_JOB_CLEAR_TIME, DEFAULT_FORWARD_URL, DEFAULT_POOL_TYPE
 
 
@@ -29,9 +31,10 @@ class WorkerConnection(object):
     It will keep a dict to save all connections of workers
     """
     __slots__ = ['_uuid', '_address', '_stream', 'pool_type', 'pool_host', 'pool_port',
-                 'miner_name', 'miner_name_real', 'first_difficult_msg', 'subscribe_msg', 'subscribe_id',
+                 'miner_name', 'miner_name_real', 'first_job_msg',
+                 'first_difficult_msg', 'subscribe_msg', 'subscribe_id',
                  'authorize_id', 'authorize_status', 'extraNonce1_real', 'extraNonce1', 'extraNonce2_size',
-                 'difficulty', 'jobs', 'submit_jobs']
+                 'difficulty', 'jobs', 'submit_jobs', 'is_keepalive']
 
     conns = PoolConnection()
 
@@ -48,6 +51,7 @@ class WorkerConnection(object):
         self.miner_name_real = ''
 
         self.first_difficult_msg = ''
+        self.first_job_msg = ''
         self.subscribe_msg = ''
         self.subscribe_id = 0
         self.authorize_id = 0
@@ -59,6 +63,7 @@ class WorkerConnection(object):
         self.difficulty = 1
         self.jobs = {}
         self.submit_jobs = {}
+        self.is_keepalive = False
         WorkerConnection.conns.worker_connections[self._uuid] = self
         app_log.info("New worker connection:{} ".format(address))
 
@@ -72,12 +77,19 @@ class WorkerConnection(object):
     @coroutine
     def handle_message(self, msg):
         try:
-            # app_log.debug('Worker received data:{}'.format(msg))
+            # for keepalive message
+            if b'PROXY TCP4' in msg:
+                self.is_keepalive = True
+                yield self.read_message()
+                return
+
+            app_log.info('Worker [{}@{}] received data: {}'.format(self._uuid, self.miner_name_real, msg))
+
             if self.pool_type >= 0:
                 data = json_decode(msg)
                 method = data.get('method', '')
                 if method == 'mining.submit':
-                    yield self.handel_submit(data)
+                    yield self.handle_submit(data)
                 else:
                     pool_conn = self.get_pool_conn()
                     if pool_conn:
@@ -92,7 +104,7 @@ class WorkerConnection(object):
                     self.subscribe_id = data['id']
                     yield self.reply_subscribe()
                 elif method == 'mining.authorize':
-                    yield self.handel_authorize(data)
+                    yield self.handle_authorize(data)
         except:
             app_log.info(format_exc())
 
@@ -117,22 +129,25 @@ class WorkerConnection(object):
         return None
 
     @coroutine
-    def handel_authorize(self, data):
+    def handle_authorize(self, data):
         self.authorize_id = data['id']
         self.miner_name_real = data['params'][0]
 
         _miner_name = self.miner_name_real.split('.')
         if len(_miner_name) == 1:
-            yield self.send_result(data['id'], ErrorCode.INVALID_MINER_NAME)
-            self._stream.close()
+            # yield self.send_result(data['id'], ErrorCode.INVALID_MINER_NAME)
+            # return self._stream.close()
+            worker_name = 'default'
+        else:
+            worker_name = _miner_name[1]
 
         auth_ret = yield miner_auth(_miner_name[0])
         app_log.debug('Auth data:{}'.format(auth_ret))
-        # {"sha256": "bitcoin","share_forward_url": "", "share_forward_name":"", "pool_type":0}
+        # {"sha256": "bitcoin","forward_url": "", "forward_name":"", "pool_type":0}
         if not auth_ret:
             self.pool_type = DEFAULT_POOL_TYPE
             forward_url = DEFAULT_FORWARD_URL
-            forward_miner_name = self.miner_name_real
+            forward_miner_name = POOL_MINER_NAME
         else:
             self.pool_type = auth_ret.get('pool_type', 0)
             forward_miner_name = auth_ret.get('forward_miner_name', POOL_MINER_NAME)
@@ -140,6 +155,8 @@ class WorkerConnection(object):
             if not forward_url:
                 self.pool_type = DEFAULT_POOL_TYPE
                 forward_url = DEFAULT_FORWARD_URL
+            if not forward_miner_name:
+                forward_miner_name = POOL_MINER_NAME
 
         share_forward = forward_url.split(':')
         if len(share_forward) != 2:
@@ -159,12 +176,12 @@ class WorkerConnection(object):
         if self.pool_type == 0:
             self.miner_name = self.miner_name_real
         else:
-            self.miner_name = '.'.join([forward_miner_name, *_miner_name[1:]])
+            self.miner_name = '.'.join([forward_miner_name, worker_name])
             data['params'][0] = self.miner_name
         yield pool_conn.send_message(json_encode(data))
 
     @coroutine
-    def handel_submit(self, data):
+    def handle_submit(self, data):
         data['params'][2] = self.extraNonce1 + data['params'][2]
 
         pool_conn = self.get_pool_conn()
@@ -193,22 +210,21 @@ class WorkerConnection(object):
 
     @coroutine
     def handle_notify(self, data, job_id, clear_job):
-        if self.authorize_status is False:
-            app_log.debug('handle_notify:Not authorized yet for worker:{}'.format(self._address))
-            return
-
         data['params'][2] += self.extraNonce1_real
+
         if self.pool_type > 0:
             self.clear_jobs(clear_job)
-            if job_id not in self.jobs:
-                self.jobs[job_id] = {
-                    'difficulty': self.difficulty,
-                    'nbits': data['params'][-3],
-                    'timestamp': int(time.time())
-                }
-                yield self.send_message(json_encode(data))
-        else:
-            yield self.send_message(json_encode(data))
+            self.jobs[job_id] = {
+                'difficulty': self.difficulty,
+                'nbits': data['params'][-3],
+                'height': Utils.extract_height(data['params'][2]),
+                'timestamp': int(time.time())
+            }
+        if self.authorize_status is False:
+            self.first_job_msg = json_encode(data)
+            app_log.debug('handle_notify:Not authorized yet for worker:{}'.format(self._address))
+            return
+        yield self.send_message(json_encode(data))
 
     @coroutine
     def handle_stratum_response(self, msg):
@@ -237,15 +253,25 @@ class WorkerConnection(object):
             if self.first_difficult_msg:
                 yield self.send_message(self.first_difficult_msg)
                 self.first_difficult_msg = ''
+            if self.first_job_msg:
+                yield self.send_message(self.first_job_msg)
+                self.first_job_msg = ''
             return
         elif resp_id in self.submit_jobs.keys():
             if self.pool_type > 0:
                 job_id = self.submit_jobs.pop(resp_id, {}).get('job_id', '')
                 job = self.jobs.get(job_id, None)
                 if job:
-                    is_valid = True if data['result'] else False
-                    yield WorkerConnection.kafka_producer.submit_share(self.pool_type, self.miner_name_real,
-                                                                       job['difficulty'], job['nbits'], is_valid)
+                    kafka_data = {
+                        'pool_type': self.pool_type,
+                        'worker_name': self.miner_name_real,
+                        'shares': job['difficulty'],
+                        'height': job['height'],
+                        'nbits': job['nbits'],
+                        'ip': self._address[0],
+                        'is_valid': True if data['result'] else False
+                    }
+                    yield WorkerConnection.kafka_producer.submit_share(**kafka_data)
         yield self.send_message(msg)
 
     @coroutine
@@ -280,7 +306,7 @@ class WorkerConnection(object):
 
     @coroutine
     def send_message(self, message):
-        app_log.info('Send message to worker:{}'.format(message))
+        app_log.info('Send message to worker [{}@{}]: {}'.format(self._uuid, self.miner_name_real, message))
         if isinstance(message, str):
             message = bytes(message, encoding='utf-8')
         try:
@@ -330,17 +356,18 @@ class WorkerConnection(object):
             app_log.info(format_exc())
 
     def on_close(self):
-        work_conn = WorkerConnection.conns.worker_connections.pop(self._uuid, None)
+        WorkerConnection.conns.worker_connections.pop(self._uuid, None)
         pool_conn = WorkerConnection.conns.pool_connections.pop(self._uuid, None)
         self.close_conn(pool_conn)
-        self.close_conn(work_conn)
-        app_log.info("Worker connection has been closed. uuid:{}".format(self._uuid))
+        if self.is_keepalive is False:
+            app_log.info("Worker connection has been closed. uuid:{}. worker_name:{}"
+                         "".format(self._uuid, self.miner_name_real))
 
     @classmethod
     def close_conn(cls, conn):
-        app_log.info('Close conn:{}. uuid:{}'.format(conn, conn._uuid))
         try:
             if conn:
+                app_log.info('Close conn:{}. uuid:{}'.format(conn, conn._uuid))
                 conn._stream.close()
         except:
             app_log.info(format_exc())
@@ -361,7 +388,7 @@ class ProxyTCPClient(TCPClient):
 
     def on_close(self):
         try:
-            app_log.debug('Pool connect closed. uuid:{}'.format(self._uuid))
+            app_log.debug('Pool connection closed. uuid:{}'.format(self._uuid))
             WorkerConnection.conns.pool_connections.pop(self._uuid, None)
             worker_conn = WorkerConnection.conns.worker_connections.pop(self._uuid, None)
             if worker_conn:
@@ -387,14 +414,14 @@ class ProxyTCPClient(TCPClient):
         :return:
         """
         try:
-            app_log.info('Send message to pool:{}'.format(message))
+            app_log.info('Send message to pool [{}]: {}'.format(self._uuid, message))
             if isinstance(message, str):
                 message = bytes(message, encoding='utf-8')
             if message[-1] != b'\n':
                 message += b'\r\n'
             yield self._stream.write(message)
         except StreamClosedError:
-            self.close()
+            self.on_close()
         except:
             app_log.debug(format_exc())
 
@@ -403,19 +430,20 @@ class ProxyTCPClient(TCPClient):
         try:
             yield self._stream.read_until(b'\n', self.handle_message)
         except StreamClosedError:
-            pass
+            self.on_close()
 
     @coroutine
     def handle_message(self, msg):
         try:
-            app_log.debug('Pool connection recieved message:{}'.format(msg))
+            app_log.debug('Pool connection [{}] recieved message: {}'.format(self._uuid, msg))
 
             worker_conn = self.get_worker_conn()
             if not worker_conn:
                 app_log.info('Worker connection not found. uuid:{}'.format(self._uuid))
                 app_log.debug(WorkerConnection.conns.worker_connections)
                 WorkerConnection.conns.pool_connections.pop(self._uuid, None)
-                return self.close()
+                self._stream.close()
+                return
 
             data = json_decode(msg)
             resp_id = data.get('id', None)
@@ -437,5 +465,3 @@ class ProxyTCPClient(TCPClient):
 
     def get_worker_conn(self):
         return WorkerConnection.conns.worker_connections.get(self._uuid, None)
-
-

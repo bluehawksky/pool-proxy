@@ -8,6 +8,7 @@ import random
 import pickle
 import zlib
 import struct
+import binascii
 from copy import deepcopy
 from traceback import format_exc
 from contextlib import contextmanager
@@ -201,6 +202,25 @@ class Utils:
         return result
 
     @classmethod
+    def reverseHex(cls, data):
+        """
+        Flip byte order in the given data (hex string).
+        """
+        b = bytearray(binascii.unhexlify(data))
+        b.reverse()
+        return binascii.hexlify(b)
+
+    @classmethod
+    def get_reward(cls, blockchain, height):
+        if blockchain in ('bitcoin', 'bitcoincash', 'superbitcoin',):
+            return (5000000000 >> (max(height, 0) // 210000)) * .00000001
+        if blockchain in ('litecoin', 'litecoincash'):
+            return (5000000000 >> (max(height, 0) // 840000)) * .00000001
+        if blockchain in ('bitcoindiamond', ):
+            return (50000000000 >> (max(height, 0) // 210000)) * .00000001
+        return 0
+
+    @classmethod
     def bits_to_target(cls, nbits):
         bits = struct.pack('<L', int(nbits, 16))
         return struct.unpack('<L', bits[:3] + b'\0')[0] * 2 ** (8 * (bits[3] - 3))
@@ -216,7 +236,24 @@ class Utils:
         return float(diff1) / difficulty
 
     @classmethod
-    def calculate_pps_value(cls, mining_algo, job_target, shares):
+    def calculate_pps_value(cls, mining_algo, job_target, shares, reward):
         target = cls.diff_to_target(mining_algo, shares)
-        pps_value = max(float(job_target + 1) / float(target + 1) * 12.5, 0.0)
+        pps_value = max(float(job_target + 1) / float(target + 1) * reward, 0.0)
         return pps_value
+
+    @classmethod
+    def extract_height(cls, coinbase1):
+        """
+
+        :param coinbase1: str in notify data, params:[job_id, pre_hash, coinbase1,...]
+        :return:
+        """
+        try:
+            coinbase_placeholder = '00000000000000000000000000000000000000ffffffff'
+            _, coinb2 = coinbase1.split(coinbase_placeholder)
+            count = int(coinb2[2:4], 16)
+            height_hex = coinb2[4: 4 + 2 * count]
+            return int(cls.reverseHex(height_hex), 16)
+        except:
+            return 0
+
